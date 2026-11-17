@@ -288,6 +288,9 @@ def test_query_failure_is_sanitized():
 
 @pytest.mark.parametrize("sqlstate,outcome", [
     ("23505", TransactionOutcome.NOT_COMMITTED),
+    ("23502", TransactionOutcome.NOT_COMMITTED),
+    ("23514", TransactionOutcome.NOT_COMMITTED),
+    ("40003", TransactionOutcome.UNKNOWN),
     ("40001", TransactionOutcome.NOT_COMMITTED),
     ("40P01", TransactionOutcome.NOT_COMMITTED),
     ("08006", TransactionOutcome.UNKNOWN),
@@ -407,3 +410,65 @@ def test_used_report_is_rejected_without_opening_session():
         with session_scope(factory, report=report):
             pass
     factory.assert_not_called()
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["driver", "sqlalchemy"])
+@pytest.mark.parametrize("rollback_fails", [False, True])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_40003_stays_unknown_without_retry_or_sensitive_output(
+    wrapped, rollback_fails, close_fails, capsys, caplog,
+):
+    # The original exception mimics psycopg's sqlstate attribute; no DB is used.
+    wrapped_error = driver_error("40003")
+    failure = wrapped_error if wrapped else wrapped_error.orig
+    session = Mock()
+    report = TransactionReport()
+    factory = Mock(side_effect=[
+        session, AssertionError("Automatic session retry is forbidden."),
+    ])
+    session.commit.side_effect = [
+        failure, AssertionError("Automatic commit retry is forbidden."),
+    ]
+
+    def rollback():
+        assert report.outcome is TransactionOutcome.UNKNOWN
+        if rollback_fails:
+            raise RuntimeError(SENSITIVE_ERROR)
+
+    def close():
+        assert report.outcome is TransactionOutcome.UNKNOWN
+        if close_fails:
+            raise RuntimeError(SENSITIVE_ERROR)
+
+    session.rollback.side_effect = rollback
+    session.close.side_effect = close
+    operations = []
+
+    with pytest.raises(DatabaseCommitError) as caught:
+        with session_scope(factory, report=report):
+            operations.append("executed")
+
+    primary = caught.value
+    assert type(primary) is DatabaseCommitError
+    assert primary.stage == report.failed_stage == "commit"
+    assert primary.outcome is TransactionOutcome.UNKNOWN
+    assert report.outcome is TransactionOutcome.UNKNOWN
+    expected_cleanup = (
+        (["rollback"] if rollback_fails else [])
+        + (["session_close"] if close_fails else [])
+    )
+    assert report.cleanup_failures == primary.cleanup_failures == expected_cleanup
+    assert len(getattr(primary, "__notes__", [])) == len(expected_cleanup)
+    assert operations == ["executed"]
+    factory.assert_called_once_with()
+    session.commit.assert_called_once_with()
+    session.rollback.assert_called_once_with()
+    session.close.assert_called_once_with()
+
+    # Error chains/cleanup notes must not expose the dummy driver message.
+    assert primary.__suppress_context__ is True
+    assert SENSITIVE_ERROR not in formatted(primary)
+    assert "unit-test SQL" not in formatted(primary)
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    assert caplog.text == ""

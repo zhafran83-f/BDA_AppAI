@@ -30,7 +30,10 @@ def _commit_failure_outcome(exc: Exception) -> TransactionOutcome:
     original = getattr(exc, "orig", None)
     driver_error = original if original is not None else exc
     sqlstate = getattr(driver_error, "sqlstate", None)
-    # Server integrity/transaction-rollback errors confirm rejection.
+    # Statement completion is uncertain despite belonging to SQLSTATE class 40.
+    if sqlstate == "40003":
+        return TransactionOutcome.UNKNOWN
+    # Other server integrity/transaction-rollback errors confirm rejection.
     # Transport failures, missing SQLSTATE and other failures stay uncertain.
     if isinstance(sqlstate, str) and sqlstate[:2] in ("23", "40"):
         return TransactionOutcome.NOT_COMMITTED
